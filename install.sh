@@ -58,6 +58,15 @@ if [[ "$got_sha" != "$want_sha" ]]; then
   exit 1
 fi
 
+if [[ "${SANDBOX_CHECK_VERIFY_ATTESTATION:-0}" == "1" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Humanet sandbox-check install: gh CLI is required when SANDBOX_CHECK_VERIFY_ATTESTATION=1" >&2
+    exit 1
+  fi
+  echo "Verifying GitHub build provenance attestation for ${bin_name}..."
+  gh attestation verify "${tmp}/${bin_name}" --repo "${REPO}"
+fi
+
 chmod 0755 "${tmp}/${bin_name}"
 if [[ -w "$INSTALL_DIR" ]]; then
   install -m 0755 "${tmp}/${bin_name}" "${INSTALL_DIR}/sandbox-check"

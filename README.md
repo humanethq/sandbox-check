@@ -1,46 +1,58 @@
 # ![Humanet sandbox-check](docs/head.png)
 
-![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+[![CI](https://github.com/humanethq/sandbox-check/actions/workflows/ci.yml/badge.svg)](https://github.com/humanethq/sandbox-check/actions/workflows/ci.yml) ![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-A zero-dependency Go CLI that verifies isolation **from inside** an AI agent sandbox (container, pod, or microVM) — testing whether untrusted code can actually reach cloud metadata endpoints, bypass `HTTP_PROXY`, SSRF the proxy, talk to host services, escape via kernel surfaces/capabilities, exhaust host resources, or read raw API keys from its environment.
-
-Most sandbox checklists run on the host ("did we pass `--cap-drop=ALL`?"). **Inside** a real cloud VM, default Docker bridges, naive `HTTP_PROXY` configurations, and container-hardening flags still routinely leak cloud IMDS, allow raw UDP DNS tunneling, expose host services on the bridge gateway, and hand raw credentials to untrusted code.
-
-Unlike passive baseline-enumeration probes, **Humanet sandbox-check** actively tests common escape and exfiltration paths from inside the workload and **fails closed** with exit code `2` on any detected isolation gap (or `0` when all active checks pass).
+A zero-dependency Go CLI that audits sandbox isolation **from inside** an AI agent runtime (container, Kubernetes pod, or microVM) — testing whether untrusted code can actually reach cloud metadata endpoints, bypass `HTTP_PROXY` (UDP DNS, raw TCP, or `CONNECT` tunneling), SSRF the proxy, hit host services, escape shared kernel surfaces, exhaust unbounded cgroups, or read raw API keys from its environment.
 
 ---
 
-## Install
+## The Problem
 
-Precompiled static binaries (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, verified via SHA256):
+Most sandbox checklists run on the host (*"did we pass `--cap-drop=ALL`?"*). Inside real cloud VMs, container-hardening flags and `HTTP_PROXY` setups still routinely leak cloud IMDS (`169.254.169.254`), allow raw UDP:53 DNS tunneling, expose host services on the bridge gateway, permit HTTP `CONNECT` tunnels to localhost/IMDS, or pass raw secrets in process env vars.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/humanethq/sandbox-check/main/install.sh | bash
-```
-
-Or build from source (Go 1.22+):
-
-```bash
-go install github.com/humanethq/sandbox-check/cmd/sandbox-check@latest
-```
+**Humanet sandbox-check** tests common escape and exfiltration paths directly from inside the workload and **fails closed** with deterministic exit codes (`0` pass, `2` failure, `3` warnings/inconclusive).
 
 ---
 
-## Quick Usage
+## Quick Start
 
-Run directly inside any container, Kubernetes pod, or microVM:
+### Install precompiled binary (`v0.2.0`, SHA256-verified)
 
 ```bash
-# Human-readable isolation check report (exit code 2 if any check fails, 0 if clean)
+# Pinned release install (recommended)
+curl -fsSL https://raw.githubusercontent.com/humanethq/sandbox-check/main/install.sh \
+  | SANDBOX_CHECK_VERSION=v0.2.0 bash
+```
+
+To verify build provenance via GitHub Artifact Attestations (`gh` CLI required):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/humanethq/sandbox-check/main/install.sh \
+  | SANDBOX_CHECK_VERSION=v0.2.0 SANDBOX_CHECK_VERIFY_ATTESTATION=1 bash
+```
+
+Or install from source (Go 1.22+):
+
+```bash
+go install github.com/humanethq/sandbox-check/cmd/sandbox-check@v0.2.0
+```
+
+### Run inside a sandbox
+
+```bash
+# Human-readable isolation audit report
 sandbox-check
 
-# Machine-readable JSON report (for CI / automated harnesses)
+# Structured JSON report (for CI / automated harnesses)
 sandbox-check --json
+
+# Fail closed even on WARN results (treat HTTP 502 proxy errors or unthrottled CPU as exit 2)
+sandbox-check --strict
 
 # Assert cross-tenant isolation against another sandbox IP:port on the same host
 sandbox-check --peer 10.244.0.15:8080
 
-# Intentional direct public HTTPS egress (only audit IMDS, host, lateral, runtime, limits, secrets)
+# Allow direct outbound TCP:443 when public internet access is intentional
 sandbox-check --allow-public-net
 ```
 
@@ -48,62 +60,156 @@ sandbox-check --allow-public-net
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--json` | `false` | Emit structured JSON report to stdout |
-| `--timeout` | `900ms` | Per-check network dial timeout |
+| `--json` | `false` | Emit structured JSON report (`tool`, `version`, `verdict`, `summary`, `probes`) |
+| `--strict` | `false` | Exit `2` on `WARN` results (instead of exit `3`) |
+| `--timeout` | `900ms` | Per-probe network dial timeout |
 | `--gateway` | auto (`/proc/net/route`) | Override detected gateway IP for host service checks |
-| `--peer` | `""` | Optional `ip:port` of another tenant/sandbox to verify L3 deny |
-| `--external-ip` | `1.1.1.1` | Public IP used to test direct raw TCP:443 / TCP:25 egress bypass |
-| `--allow-public-net` | `false` | Do not fail direct outbound TCP:443 when public net is intentional |
+| `--peer` | `""` | Optional `ip:port` of another tenant/sandbox to assert L3 deny |
+| `--external-ip` | `1.1.1.1` | Public IP used for direct raw TCP:443 / TCP:25 bypass checks |
+| `--allow-public-net` | `false` | Do not fail direct outbound TCP:443 when public egress is intentional |
 | `--version` | `false` | Print Humanet sandbox-check version and exit |
 
 ---
 
-## What It Checks (8 Categories)
+## Example Output
 
-Every run starts with a `baseline_network_posture` (`INFO`) check recording non-loopback interfaces, default gateway, resolvers, and proxy environment variables so empty/offline environments are never misread as "filtered".
+### CLI summary (hardened Docker container with default bridge)
+
+```text
+HUMANET SANDBOX-CHECK v0.2.0 — runtime=docker_container (linux/amd64) uid=65532 pid1="sandbox-check" gw="172.17.0.1" proxy_env=true
+======================================================================================
+
+[BASELINE]
+  INFO baseline_network_posture         eth0                     routed_with_gateway+http_proxy
+
+[CLOUD METADATA / IMDS]
+  FAIL imds_aws_gcp_azure_v4            169.254.169.254:80/me... metadata_exposed_http_200 (CRITICAL)
+       -> HTTP GET http://169.254.169.254:80/metadata/instance?api-version=2021-02-01 responded 200 (2129 bytes body omitted)
+
+[PROXY BYPASS & DIRECT EGRESS]
+  FAIL bypass_udp53_cloudflare          1.1.1.1:53/udp           dns_tunnel_bypass (CRITICAL)
+  FAIL proxy_ssrf_imds_v4               http://169.254.169.2... proxy_ssrf_http_200 (CRITICAL)
+  WARN proxy_ssrf_loopback_docker       http://127.0.0.1:2375... proxy_upstream_error_http_502 (CRITICAL)
+  FAIL proxy_connect_imds_v4            CONNECT 169.254.169.... proxy_connect_tunnel_open (CRITICAL)
+...
+SUMMARY: total=40 pass=23 fail=15 warn=1 info=1 skip=0 (critical=7 high=7)
+RESULT: ISOLATION GAPS DETECTED [verdict=fail] (exit code 2)
+```
+
+*(When `fail=0` and `warn>0`, `sandbox-check` explicitly outputs `RESULT: WARNINGS DETECTED / INCONCLUSIVE [verdict=warn] (exit code 3)`, never `"NO DETECTED LEAKS"`.)*
+
+### JSON snippet (`--json`)
+
+```json
+{
+  "tool": "sandbox-check",
+  "version": "v0.2.0",
+  "verdict": "fail",
+  "summary": {
+    "total": 40,
+    "passed": 23,
+    "failed": 15,
+    "warned": 1,
+    "info": 1,
+    "skipped": 0,
+    "critical_leaks": 7,
+    "high_leaks": 7
+  }
+}
+```
+
+---
+
+## What It Checks & Status Semantics
+
+### 8 Probe Categories
 
 | Category | Checks | Why it matters |
 |---|---|---|
-| **Cloud Metadata / IMDS** | `169.254.169.254:80` (AWS v1, AWS IMDSv2 PUT token, Azure `/metadata/instance?api-version=2021-02-01`, GCP `/computeMetadata/v1/`), ECS `169.254.170.2`, AWS IPv6 `[fd00:ec2::254]`, Alibaba `100.100.100.200` | Connects directly with `Proxy: nil` (ignoring `HTTP_PROXY`). Never logs or prints response bodies — only status codes and byte counts. |
-| **Proxy Bypass & SSRF** | Direct UDP:53 (`1.1.1.1`, `8.8.8.8`), direct TCP:53, direct TCP:443; if `HTTP_PROXY`/`HTTPS_PROXY` is set, also checks proxy SSRF to IMDS IPv4 and `http://127.0.0.1:2375/_ping` | Catches **"proxy theater"**: setting `HTTP_PROXY` while leaving raw UDP/TCP open, or running a naive proxy that forwards requests to cloud IMDS or host loopback (`403/407/451` = `PASS`, `502` = `WARN`, `2xx` = `FAIL`). |
-| **Host Gateway Services** | Auto-detected gateway + `host.docker.internal` across ports `22` (SSH), `80` (HTTP), `2375` (Docker), `4222` (NATS), `5432` (Postgres), `6379` (Redis), `9000` (MinIO), `10250` (Kubelet), `11434` (Ollama) | Bridge gateways frequently expose host daemons bound to `0.0.0.0` or bridge interfaces. |
-| **Lateral RFC1918 & SMTP** | `10.0.0.1:80`, `172.16.0.1:80`, `172.17.0.1:80`, `192.168.1.1:80`, CGNAT `100.64.0.1:80`, SMTP `1.1.1.1:25`, optional `--peer` | Verifies private network lateral denial and anti-spam port 25 blocking. |
-| **Kernel, Caps & Mounts** | `/proc/self/status` (`CapEff`, `Seccomp`, `NoNewPrivs`), `/proc/mounts` (runtime sockets, host home binds, rw shared cgroup v2), `/proc/kcore`, `/proc/sysrq-trigger`, `core_pattern`, `uevent_helper`, `/var/run/docker.sock`, `containerd.sock`, `crio.sock`, `/dev/kvm`, `/dev/mem` | Distinguishes shared-kernel containers from dedicated microVM guest kernels (`virtio-mmio` / DMI detection) so guest-local `devtmpfs`/`procfs` inside a hypervisor isn't misreported as host exposure while nested `/dev/kvm` still fails. |
-| **Resource Limits** | Cgroup v2 `memory.max`, `pids.max`, `cpu.max` in containers; hypervisor `MemTotal` / vCPU ceiling (`/proc/meminfo`) in microVMs | Unbounded `memory.max=max` or `pids.max=max` allows trivial fork/OOM DoS against sibling workloads. |
-| **Environment Secrets** | Scans env key names (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `DATABASE_URL`, etc.) | Flags raw credential values in guest env (`FAIL`) while recognizing placeholder/phantom tokens (`phm_*`, `phantom_*`, `vault:*`, `op://*`) as `PASS`. Never outputs secret or phantom values. |
+| **Baseline** (`INFO`) | `baseline_network_posture` | Records non-loopback IPs, gateway, DNS resolvers, and proxy env so offline sandboxes are not confused with firewalling. |
+| **Cloud Metadata / IMDS** | `169.254.169.254` (AWS v1, IMDSv2 PUT token, Azure, GCP), ECS `169.254.170.2`, IPv6 `[fd00:ec2::254]`, Alibaba `100.100.100.200` | Connects directly (`Proxy: nil`, bypassing `HTTP_PROXY`). Never logs response bodies — only HTTP status and byte counts. |
+| **Proxy Bypass & SSRF** | UDP:53 (`1.1.1.1`, `8.8.8.8`, verifying DNS `QR=1` vs raw echo), direct TCP:53/TCP:443; when `HTTP_PROXY` is set: multi-path IMDS HTTP SSRF, loopback `:2375` SSRF, and raw `CONNECT` tunnel probes to IMDS/loopback | Catches **"proxy theater"**: setting `HTTP_PROXY` while leaving raw sockets open, path-filtering only `/latest/meta-data/`, or permitting `CONNECT 169.254.169.254:80`. |
+| **Host Gateway Services** | Auto gateway + `host.docker.internal` on ports `22`, `80`, `2375` (Docker), `4222` (NATS), `5432` (Postgres), `6379` (Redis), `9000` (MinIO), `10250` (Kubelet), `11434` (Ollama) | Bridge gateways frequently expose host daemons listening on `0.0.0.0` or bridge interfaces. |
+| **Lateral RFC1918 & SMTP** | `10.0.0.1:80`, `172.16.0.1:80`, `172.17.0.1:80`, `192.168.1.1:80`, `100.64.0.1:80`, `1.1.1.1:25`, optional `--peer` | Verifies private network lateral deny and outbound SMTP port 25 blocking. |
+| **Kernel, Caps & Mounts** | Runtime detection (Docker `.dockerenv`, Podman `.containerenv`, cgroup v1/v2, PID-1 `container=`, root `overlay`, Firecracker `virtio-mmio`, DMI fallback), `CapEff`, `Seccomp`, `NoNewPrivs`, `/proc/mounts` + `/proc/self/mountinfo` (sockets, host `/home`/`/Users`/`/root` binds, `rw /sys/fs/cgroup`), `/proc/kcore`, `/proc/sysrq-trigger`, `core_pattern`, `uevent_helper`, host sockets & `/dev/{kvm,mem}` | Prevents containers with private cgroup namespaces (`0::/`) on cloud VMs from being misclassified as VMs while accurately handling true dedicated Firecracker guest kernels. |
+| **Resource Limits** | Cgroup v2 (`memory.max`, `pids.max`, `cpu.max`), cgroup v1 fallback (`memory.limit_in_bytes`, `pids.max`, `cpu.cfs_quota_us`), and microVM `/proc/meminfo` + vCPU bounds | Fails on unbounded memory or PIDs; emits `WARN` (`unthrottled_cpu`) when memory/PIDs are bounded yet CPU quota is `max`/`-1`. |
+| **Environment Secrets** | Env key audit (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `DATABASE_URL`, etc.) | Fails on raw secret values (always redacted); passes when only placeholder/phantom tokens (`phm_*`, `phantom_*`, `vault:*`, `op://*`) exist. |
+
+### Statuses & Exit Codes
+
+| Status | Meaning | Default Exit Code | `--strict` Exit Code |
+|---|---|---:|---:|
+| `PASS` | Blocked (`dropped_timeout`, `refused`, `unreachable`, `no_route`, `blocked_seccomp`), explicit proxy deny (`403`/`407`/`451`), absent socket, bounded limits, or no raw secrets | `0` | `0` |
+| `WARN` | Ambiguous/partial risk (e.g. proxy returned `502`/`5xx` indicating upstream dial attempt, or bounded memory/PIDs with unthrottled `cpu.max`) | **`3`** (`verdict: "warn"`) | **`2`** |
+| `FAIL` | Confirmed leak or missing boundary (open IMDS, DNS tunnel bypass, proxy SSRF `2xx`/`CONNECT`, reachable host service, dangerous caps, unbounded memory/PIDs, raw secret) | **`2`** (`verdict: "fail"`) | **`2`** |
+| `INFO` / `SKIP` | Context record (`baseline_network_posture`) or platform N/A (`non_linux_host` on macOS) | `0` | `0` |
+
+---
+
+## Platform Support & Kubernetes Usage
+
+| Platform | Network, IMDS, Proxy Bypass, Secrets | Kernel, Caps, Mounts, Cgroup Limits |
+|---|---|---|
+| **Linux** (`amd64`, `arm64`) | Supported | Supported (cgroup v2 + v1 fallback) |
+| **macOS** (`amd64`, `arm64`) | Supported | `SKIP` (`non_linux_host`) — intended for running inside Linux containers/VMs |
+
+### Ephemeral Kubernetes Pod check
+
+Run a temporary SHA256-verified probe pod in the target namespace (`linux/amd64`):
+
+```bash
+kubectl run sandbox-check --rm -i --restart=Never --image=alpine:3.20 -- sh -ec '
+  apk add -q --no-cache curl
+  curl -fsSLO https://github.com/humanethq/sandbox-check/releases/download/v0.2.0/sandbox-check-linux-amd64
+  curl -fsSLO https://github.com/humanethq/sandbox-check/releases/download/v0.2.0/checksums.txt
+  grep "sandbox-check-linux-amd64" checksums.txt | sha256sum -c -
+  chmod +x sandbox-check-linux-amd64 && ./sandbox-check-linux-amd64
+'
+```
+
+Or copy the static Linux binary directly into any running pod or container:
+
+```bash
+kubectl cp ./sandbox-check-linux-amd64 my-pod:/tmp/sandbox-check
+kubectl exec -it my-pod -- /tmp/sandbox-check --json
+```
 
 ---
 
 ## Live Benchmark Snapshot (Cloud Linux KVM Host)
 
-All 5 configurations were executed sequentially on the same cloud Linux KVM host (`linux/amd64`), comparing standard Docker setups against a jailed Firecracker microVM. Full methodology, Docker baseline commands/JSON outputs, and scope limits are in [`benchmark/REPORT.md`](benchmark/REPORT.md).
+Executed sequentially on the same cloud Linux KVM host (`linux/amd64`, with live link-local cloud metadata on `169.254.169.254`). Full methodology, Docker commands, and captured JSON files are in [`benchmark/REPORT.md`](benchmark/REPORT.md).
 
-| Configuration | Active Checks Passed | Fail | Warn | Crit / High | Key Empirical Findings |
+| Configuration | Active Checks Passed | Fail | Warn | Crit / High | Key Findings |
 |---|---:|---:|---:|---:|---|
 | **Docker default** (`docker run`) | 23/35 (`+1 INFO`) | **12** | 0 | **2 / 9** | Cloud IMDS **HTTP 200** (`2129 B`), UDP:53 & TCP:443 open, host `:22`/`:80` open, 6 caps, `memory.max=max`, raw secret |
 | **Docker + Naive `HTTP_PROXY`** | 23/37 (`+1 INFO`) | **13** | **1** | **5 / 8** | UDP:53 DNS tunnel bypasses proxy; **proxy SSRF returned Cloud IMDS HTTP 200** + loopback `502` warning |
-| **Docker hardened** (`--user 65532:65532 --cap-drop=ALL --security-opt=no-new-privileges --read-only --memory=256m --cpus=1 --pids-limit=128`) | 25/35 (`+1 INFO`) | **10** | 0 | **2 / 7** | Caps/cgroups fixed, **still leaks Cloud IMDS HTTP 200**, host `:22`/`:80`, UDP:53, TCP:443, and raw env secret |
-| **Docker `--network=none`** (hardened) | 26/26 (`+1 INFO`) | **0** | 0 | **0 / 0** | Clean (`exit 0`), **at the cost of zero outbound network** (cannot reach LLM APIs or packages) |
-| **[Frame](https://frame.humanet.dev) Firecracker microVM** (jailed microVM + host firewall + allowlisted egress proxy + placeholder token) | **37/37** (`+1 INFO`) | **0** | **0** | **0 / 0** | Isolated guest kernel with bounded CPU/RAM, host L3 drops on IMDS/gateway/RFC1918/UDP:53/TCP:25, proxy returned **403** on IMDS/loopback SSRF, allowlisted HTTPS check returned **HTTP 200** |
+| **Docker hardened** (`--cap-drop=ALL`, non-root, RO, cgroups) | 25/35 (`+1 INFO`) | **10** | 0 | **2 / 7** | Caps/cgroups fixed, **still leaks Cloud IMDS HTTP 200**, host `:22`/`:80`, UDP:53, TCP:443, and raw env secret |
+| **Docker `--network=none`** (hardened) | 26/26 (`+1 INFO`) | **0** | 0 | **0 / 0** | Passes (`exit 0`), **because networking is completely disabled** (cannot call LLM APIs or fetch dependencies) |
+| **[Frame](https://frame.humanet.dev) Firecracker microVM** (jailed microVM + host L3 drops + allowlisting proxy + placeholder token) | **37/37** (`+1 INFO`) | **0** | **0** | **0 / 0** | Passes with **allowlisted outbound HTTPS still working** (`HTTP 200`), isolated guest kernel, IMDS/RFC1918/UDP:53/TCP:25 dropped, proxy denied SSRF (`HTTP 403`), zero raw secrets |
 
-> **Result & Scope Notes:**
-> - **About the `+1 INFO` baseline (`37/37` vs `38 total`):** Every `sandbox-check` run starts with one non-failing, non-passing `INFO` check (`baseline_network_posture`) that records whether a network interface, gateway, and proxy env exist so offline environments are never mistaken for filtered ones. In the Firecracker run above, `total=38` comprises `37 PASS`, `1 INFO` baseline, `0 FAIL`, and `0 WARN`.
-> - **Not a substitute for independent security review:** `sandbox-check` verifies common workload-side misconfigurations from inside a sandbox. Passing all implemented checks does **not** guarantee "100% security" and does not replace an independent penetration test or host/hypervisor architecture audit. Operational host firewall rules, internal proxy mechanics, and provisioning internals for Frame are intentionally kept private.
+---
 
-> Built alongside [Humanet airgap-check](https://github.com/humanethq/airgap-check) and [Frame](https://frame.humanet.dev) by [Humanet](https://humanet.dev); `sandbox-check` is standalone, MIT-licensed, and requires nothing outside Go's standard library.
+## Limitations & Scope
+
+- **`refused` vs `dropped_timeout`:** When a port is closed on a reachable IP, TCP returns `ECONNREFUSED` (`observed: "refused"` -> `PASS` since nothing answered), whereas a firewall/nftables drop times out (`observed: "dropped_timeout"`). An in-guest probe cannot prove from timing alone whether a silent drop came from nftables vs blackhole routing — inspect `observed` carefully alongside host rules.
+- **Environment-only secret scope:** `env_secret_exposure` checks process environment variable names (and recognizes phantom prefixes like `phm_`/`phantom_`). Credentials stored on disk (`~/.aws`, `~/.kube`, Mounted secrets), Unix socket agents, or custom non-standard env names are out of scope.
+- **Workload audit ≠ comprehensive pentest:** Passing all `sandbox-check` probes verifies common guest-observable misconfigurations; it does not prove absence of hypervisor/kernel CVEs, DNS-over-HTTPS abuse via allowlisted domains, or application vulnerabilities, and does not replace an independent penetration test.
+
+---
+
+> Built alongside [Humanet airgap-check](https://github.com/humanethq/airgap-check) and [Frame](https://frame.humanet.dev) by [Humanet](https://humanet.dev).
 
 ---
 
 ## Development
 
 ```bash
-make test          # Run unit suite (or: go test -race -count=1 ./...)
+make test          # Run unit suite with -race
 make vet           # Run go vet
 make build         # Build local static binary into bin/sandbox-check
 make release-bins  # Cross-compile linux/darwin amd64/arm64 + SHA256 checksums
 ```
-
----
 
 ## License
 

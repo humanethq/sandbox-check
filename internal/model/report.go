@@ -49,16 +49,16 @@ type ProbeResult struct {
 }
 
 type EnvironmentInfo struct {
-	OS             string   `json:"os"`
-	Arch           string   `json:"arch"`
-	Hostname       string   `json:"hostname,omitempty"`
-	UID            int      `json:"uid"`
-	GID            int      `json:"gid"`
-	PID1Name       string   `json:"pid1_name,omitempty"`
-	DetectedRuntime string  `json:"detected_runtime"`
-	DefaultGateway string   `json:"default_gateway,omitempty"`
-	Resolvers      []string `json:"resolvers,omitempty"`
-	ProxyConfigured bool    `json:"proxy_configured"`
+	OS              string   `json:"os"`
+	Arch            string   `json:"arch"`
+	Hostname        string   `json:"hostname,omitempty"`
+	UID             int      `json:"uid"`
+	GID             int      `json:"gid"`
+	PID1Name        string   `json:"pid1_name,omitempty"`
+	DetectedRuntime string   `json:"detected_runtime"`
+	DefaultGateway  string   `json:"default_gateway,omitempty"`
+	Resolvers       []string `json:"resolvers,omitempty"`
+	ProxyConfigured bool     `json:"proxy_configured"`
 }
 
 type Summary struct {
@@ -72,9 +72,18 @@ type Summary struct {
 	High     int `json:"high_leaks"`
 }
 
+type Verdict string
+
+const (
+	VerdictPass Verdict = "pass"
+	VerdictWarn Verdict = "warn"
+	VerdictFail Verdict = "fail"
+)
+
 type Report struct {
 	Tool        string          `json:"tool"`
 	Version     string          `json:"version"`
+	Verdict     Verdict         `json:"verdict"`
 	GeneratedAt time.Time       `json:"generated_at"`
 	Environment EnvironmentInfo `json:"environment"`
 	Probes      []ProbeResult   `json:"probes"`
@@ -107,9 +116,29 @@ func ComputeSummary(probes []ProbeResult) Summary {
 	return s
 }
 
+func ComputeVerdict(s Summary) Verdict {
+	if s.Failed > 0 {
+		return VerdictFail
+	}
+	if s.Warned > 0 {
+		return VerdictWarn
+	}
+	return VerdictPass
+}
+
 func ExitCode(s Summary) int {
+	return ExitCodeWithOptions(s, false)
+}
+
+func ExitCodeWithOptions(s Summary, strict bool) int {
 	if s.Failed > 0 {
 		return 2
+	}
+	if s.Warned > 0 {
+		if strict {
+			return 2
+		}
+		return 3
 	}
 	return 0
 }

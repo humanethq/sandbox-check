@@ -2,7 +2,7 @@
 
 All runs below were executed sequentially on the **same cloud Linux KVM host** using the identical static `linux/amd64` binary so container defaults, container hardening flags, naive `HTTP_PROXY` configurations, `--network=none`, and a jailed Firecracker microVM could be compared side-by-side without synthetic mocks.
 
-*(Note: The raw Docker JSON files in [`benchmark/raw/`](raw/) preserve `"tool": "sandbox-probe"` metadata recorded during capture before the project was renamed to `Humanet sandbox-check`.)*
+*(Note: The raw Docker JSON files in [`benchmark/raw/`](raw/) were captured with `v0.1.0` and preserve `"tool": "sandbox-probe"` metadata recorded prior to renaming and `v0.2.0`'s expanded `"verdict"` / `CONNECT` SSRF / `observed` error taxonomy.)*
 
 - **Environment:** Cloud Linux VM with nested KVM (`linux/amd64`) and live link-local cloud metadata (`169.254.169.254`)
 - **Compared runtimes:** Standard Docker containers vs jailed Firecracker microVM (dedicated guest kernel + host L3 firewalling + allowlisting egress proxy)

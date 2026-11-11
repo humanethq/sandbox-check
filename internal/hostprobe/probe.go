@@ -147,7 +147,7 @@ func InspectCgroupV2Dir(dir string) model.ProbeResult {
 		Category: model.CategoryLimits,
 		Severity: model.SeverityHigh,
 		Target:   dir,
-		Expected: "bounded memory.max and pids.max (and cpu.max recommended)",
+		Expected: "bounded memory.max, pids.max, and cpu.max",
 	}
 
 	memRaw, memErr := readTrimmed(filepath.Join(dir, "memory.max"))
@@ -170,8 +170,9 @@ func InspectCgroupV2Dir(dir string) model.ProbeResult {
 		unbounded = append(unbounded, "pids.max=max")
 	}
 
+	unthrottledCPU := cpuErr == nil && (strings.HasPrefix(cpuRaw, "max ") || cpuRaw == "max")
 	cpuNote := cpuRaw
-	if strings.HasPrefix(cpuRaw, "max ") {
+	if unthrottledCPU {
 		cpuNote = cpuRaw + " (unthrottled CPU)"
 	}
 
@@ -183,27 +184,140 @@ func InspectCgroupV2Dir(dir string) model.ProbeResult {
 		return res
 	}
 
+	if unthrottledCPU {
+		res.Status = model.StatusWarn
+		res.Severity = model.SeverityMedium
+		res.Observed = "unthrottled_cpu"
+		res.Detail = fmt.Sprintf("memory/pids bounded, but cpu.max=%q allows unthrottled CPU usage; memory.max=%q pids.max=%q", cpuRaw, memRaw, pidsRaw)
+		return res
+	}
+
 	res.Status = model.StatusPass
 	res.Observed = "bounded"
 	res.Detail = fmt.Sprintf("memory.max=%q pids.max=%q cpu.max=%q", memRaw, pidsRaw, cpuNote)
 	return res
 }
 
-func resolveCurrentCgroupV2Dir() string {
-	data, err := os.ReadFile("/proc/self/cgroup")
+const cgroupV1UnlimitedThreshold = int64(1) << 60
+
+// InspectCgroupV1Dir inspects cgroup v1 hierarchy paths ({memory,pids,cpu}) for unbounded limits.
+func InspectCgroupV1Dir(dir string) model.ProbeResult {
+	return inspectCgroupV1ControllerDirs(
+		filepath.Join(dir, "memory"),
+		filepath.Join(dir, "pids"),
+		filepath.Join(dir, "cpu"),
+		dir,
+	)
+}
+
+func inspectCgroupV1ControllerDirs(memDir, pidsDir, cpuDir, targetLabel string) model.ProbeResult {
+	start := time.Now()
+	res := model.ProbeResult{
+		ID:       "cgroup_v1_limits",
+		Category: model.CategoryLimits,
+		Severity: model.SeverityHigh,
+		Target:   targetLabel,
+		Expected: "bounded cgroup v1 memory.limit_in_bytes, pids.max, and cpu.cfs_quota_us",
+	}
+
+	memRaw, memErr := readTrimmed(filepath.Join(memDir, "memory.limit_in_bytes"))
+	pidsRaw, pidsErr := readTrimmed(filepath.Join(pidsDir, "pids.max"))
+	cpuRaw, cpuErr := readTrimmed(filepath.Join(cpuDir, "cpu.cfs_quota_us"))
+
+	if memErr != nil && pidsErr != nil && cpuErr != nil {
+		res.DurationMs = time.Since(start).Milliseconds()
+		res.Status = model.StatusSkip
+		res.Observed = "no_cgroup_v1_files"
+		res.Detail = fmt.Sprintf("could not read cgroup v1 files under %s", targetLabel)
+		return res
+	}
+
+	var unbounded []string
+	if memErr == nil {
+		if memVal, err := strconv.ParseInt(memRaw, 10, 64); err != nil || memVal <= 0 || memVal >= cgroupV1UnlimitedThreshold {
+			unbounded = append(unbounded, "memory.limit_in_bytes=unlimited")
+		}
+	}
+	if pidsErr == nil && (pidsRaw == "max" || pidsRaw == "") {
+		unbounded = append(unbounded, "pids.max=max")
+	}
+
+	unthrottledCPU := cpuErr == nil && (cpuRaw == "-1" || cpuRaw == "")
+	res.DurationMs = time.Since(start).Milliseconds()
+
+	if len(unbounded) > 0 {
+		res.Status = model.StatusFail
+		res.Observed = strings.Join(unbounded, ",")
+		res.Detail = fmt.Sprintf("unbounded cgroup v1 limits [%s]; memory=%q pids=%q cpu_quota=%q", strings.Join(unbounded, ", "), memRaw, pidsRaw, cpuRaw)
+		return res
+	}
+
+	if unthrottledCPU {
+		res.Status = model.StatusWarn
+		res.Severity = model.SeverityMedium
+		res.Observed = "unthrottled_cpu"
+		res.Detail = fmt.Sprintf("memory/pids bounded, but cpu.cfs_quota_us=%q allows unthrottled CPU usage; memory=%q pids=%q", cpuRaw, memRaw, pidsRaw)
+		return res
+	}
+
+	res.Status = model.StatusPass
+	res.Observed = "bounded"
+	res.Detail = fmt.Sprintf("memory.limit_in_bytes=%q pids.max=%q cpu.cfs_quota_us=%q", memRaw, pidsRaw, cpuRaw)
+	return res
+}
+
+func resolveCurrentCgroupV2Dir(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "proc", "self", "cgroup"))
 	if err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			if strings.HasPrefix(line, "0::") {
 				rel := strings.TrimPrefix(line, "0::")
 				rel = strings.TrimPrefix(rel, "/")
-				cand := filepath.Join("/sys/fs/cgroup", rel)
+				cand := filepath.Join(root, "sys", "fs", "cgroup", rel)
 				if _, stErr := os.Stat(filepath.Join(cand, "memory.max")); stErr == nil {
 					return cand
 				}
 			}
 		}
 	}
-	return "/sys/fs/cgroup"
+	return filepath.Join(root, "sys", "fs", "cgroup")
+}
+
+func inspectCurrentCgroupV1(root string) model.ProbeResult {
+	base := filepath.Join(root, "sys", "fs", "cgroup")
+	memDir := filepath.Join(base, "memory")
+	pidsDir := filepath.Join(base, "pids")
+	cpuDir := filepath.Join(base, "cpu")
+
+	if data, err := os.ReadFile(filepath.Join(root, "proc", "self", "cgroup")); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) != 3 || parts[1] == "" {
+				continue
+			}
+			rel := strings.TrimPrefix(parts[2], "/")
+			for _, ctrl := range strings.Split(parts[1], ",") {
+				switch ctrl {
+				case "memory":
+					cand := filepath.Join(base, "memory", rel)
+					if _, err := os.Stat(filepath.Join(cand, "memory.limit_in_bytes")); err == nil {
+						memDir = cand
+					}
+				case "pids":
+					cand := filepath.Join(base, "pids", rel)
+					if _, err := os.Stat(filepath.Join(cand, "pids.max")); err == nil {
+						pidsDir = cand
+					}
+				case "cpu":
+					cand := filepath.Join(base, "cpu", rel)
+					if _, err := os.Stat(filepath.Join(cand, "cpu.cfs_quota_us")); err == nil {
+						cpuDir = cand
+					}
+				}
+			}
+		}
+	}
+	return inspectCgroupV1ControllerDirs(memDir, pidsDir, cpuDir, base)
 }
 
 func RunAll(root string) ([]model.ProbeResult, string, string) {
@@ -237,9 +351,17 @@ func RunAll(root string) ([]model.ProbeResult, string, string) {
 		results = append(results, InspectSeccompStatus(string(statusBytes), isVM))
 	}
 
-	// 1b. /proc/mounts host socket / bind mount / writable cgroup check
+	// 1b. /proc/mounts and /proc/self/mountinfo host socket / bind mount / writable cgroup check
 	if mountsBytes, err := os.ReadFile(filepath.Join(root, "proc", "mounts")); err == nil {
-		results = append(results, InspectMountsContent(string(mountsBytes), isVM))
+		mountRes := InspectMountsContent(string(mountsBytes), isVM)
+		if !isVM {
+			if miBytes, miErr := os.ReadFile(filepath.Join(root, "proc", "self", "mountinfo")); miErr == nil {
+				if extra := FindRiskyMountinfoEntries(string(miBytes), isVM); len(extra) > 0 {
+					mountRes = mergeMountFindings(mountRes, extra)
+				}
+			}
+		}
+		results = append(results, mountRes)
 	}
 
 	// 1c. Writable host kernel escape triggers (/proc/sysrq-trigger, /proc/kcore)
@@ -248,15 +370,21 @@ func RunAll(root string) ([]model.ProbeResult, string, string) {
 	// 2. Host sockets & sensitive device exposure
 	results = append(results, inspectSocketAndDevicePaths(root, isVM)...)
 
-	// 3. Cgroup v2 / Hypervisor hardware resource bounds
+	// 3. Cgroup v2 / cgroup v1 / Hypervisor hardware resource bounds
 	if isVM {
 		if memBytes, err := os.ReadFile(filepath.Join(root, "proc", "meminfo")); err == nil {
 			results = append(results, InspectVMMeminfo(string(memBytes), runtime.NumCPU()))
 		} else {
-			results = append(results, InspectCgroupV2Dir(resolveCurrentCgroupV2Dir()))
+			results = append(results, InspectCgroupV2Dir(resolveCurrentCgroupV2Dir(root)))
 		}
 	} else {
-		results = append(results, InspectCgroupV2Dir(resolveCurrentCgroupV2Dir()))
+		cgRes := InspectCgroupV2Dir(resolveCurrentCgroupV2Dir(root))
+		if cgRes.Status == model.StatusSkip {
+			if cg1Res := inspectCurrentCgroupV1(root); cg1Res.Status != model.StatusSkip {
+				cgRes = cg1Res
+			}
+		}
+		results = append(results, cgRes)
 	}
 
 	// 4. Environment secret exposure (key names only)
@@ -433,8 +561,13 @@ func detectRuntimeNameForOS(goos, root string) string {
 	if goos != "linux" {
 		return goos + "_host"
 	}
+	// 1. Strong explicit container runtime markers ALWAYS beat underlying host VM DMI
+	// (prevents containers with --cgroupns=private on EC2/GCE/Azure VMs from claiming to be VMs).
 	if _, err := os.Stat(filepath.Join(root, ".dockerenv")); err == nil {
 		return "docker_container"
+	}
+	if _, err := os.Stat(filepath.Join(root, "run", ".containerenv")); err == nil {
+		return "podman_container"
 	}
 	if cg, err := os.ReadFile(filepath.Join(root, "proc", "1", "cgroup")); err == nil {
 		text := string(cg)
@@ -443,10 +576,41 @@ func detectRuntimeNameForOS(goos, root string) string {
 			return "docker_container"
 		case strings.Contains(text, "kubepods"):
 			return "kubernetes_pod"
+		case strings.Contains(text, "libpod"):
+			return "podman_container"
 		case strings.Contains(text, "containerd"):
 			return "containerd_container"
+		case strings.Contains(text, "crio"):
+			return "crio_container"
+		case strings.Contains(text, "lxc"):
+			return "lxc_container"
 		}
 	}
+	if envBytes, err := os.ReadFile(filepath.Join(root, "proc", "1", "environ")); err == nil {
+		for _, entry := range strings.Split(string(envBytes), "\x00") {
+			if k, v, ok := strings.Cut(entry, "="); ok && k == "container" {
+				val := strings.ToLower(strings.TrimSpace(v))
+				switch val {
+				case "podman":
+					return "podman_container"
+				case "docker":
+					return "docker_container"
+				case "lxc":
+					return "lxc_container"
+				case "systemd-nspawn":
+					return "nspawn_container"
+				case "":
+					continue
+				default:
+					return "oci_container"
+				}
+			}
+		}
+	}
+
+	// 2. Hypervisor microVM markers (e.g., Firecracker virtio-mmio) checked before overlay rootfs
+	// so read-only rootfs + overlay inside Firecracker still reports firecracker_microvm,
+	// while containers lacking Firecracker markers fall through to overlay container detection.
 	if cmdline, err := os.ReadFile(filepath.Join(root, "proc", "cmdline")); err == nil {
 		cl := string(cmdline)
 		if strings.Contains(cl, "firecracker") || strings.Contains(cl, "virtio_mmio") {
@@ -461,6 +625,18 @@ func detectRuntimeNameForOS(goos, root string) string {
 	if _, err := os.Stat(filepath.Join(root, "sys", "devices", "platform", "virtio-mmio.0")); err == nil {
 		return "firecracker_microvm"
 	}
+
+	// 3. Container rootfs detection (/proc/mounts or /proc/self/mounts showing overlay/aufs/shiftfs on "/").
+	for _, mountsPath := range []string{filepath.Join(root, "proc", "mounts"), filepath.Join(root, "proc", "self", "mounts")} {
+		if mb, err := os.ReadFile(mountsPath); err == nil {
+			if hasContainerRootOverlay(string(mb)) {
+				return "oci_container"
+			}
+			break
+		}
+	}
+
+	// 4. Generic VM DMI fallback (reached only when no container signal is present).
 	if dmi, err := os.ReadFile(filepath.Join(root, "sys", "class", "dmi", "id", "product_name")); err == nil {
 		name := strings.TrimSpace(string(dmi))
 		if name != "" {
@@ -468,6 +644,24 @@ func detectRuntimeNameForOS(goos, root string) string {
 		}
 	}
 	return "linux_unknown"
+}
+
+func hasContainerRootOverlay(mountsContent string) bool {
+	for _, line := range strings.Split(mountsContent, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		target, fstype := fields[1], fields[2]
+		if target != "/" {
+			continue
+		}
+		switch fstype {
+		case "overlay", "overlayfs", "aufs", "fuse-overlayfs", "shiftfs":
+			return true
+		}
+	}
+	return false
 }
 
 func InspectMountsContent(content string, isVM bool) model.ProbeResult {
@@ -498,9 +692,11 @@ func InspectMountsContent(content string, isVM bool) model.ProbeResult {
 			}
 		}
 
-		// Host macOS/Linux user tree bind mounts
-		if !isVM && (strings.Contains(target, "/Users/") || strings.HasPrefix(src, "/Users/")) {
-			risky = append(risky, fmt.Sprintf("host_user_mount:%s", target))
+		// Host macOS/Linux user tree or sensitive host config bind mounts (exclude ephemeral container tmpfs)
+		if !isVM && fstype != "tmpfs" && fstype != "ramfs" && fstype != "proc" && fstype != "sysfs" {
+			if isSensitiveHostBind(src) || isSensitiveHostBind(target) {
+				risky = append(risky, fmt.Sprintf("host_bind_mount:%s", target))
+			}
 		}
 
 		// In shared-kernel containers, rw /sys/fs/cgroup widens cgroup escape surface;
@@ -534,6 +730,89 @@ func InspectMountsContent(content string, isVM bool) model.ProbeResult {
 		res.Detail = "no risky host socket, user home, or rw shared cgroup mounts detected"
 	}
 	return res
+}
+
+func isSensitiveHostBind(p string) bool {
+	if strings.Contains(p, "/Users/") || strings.HasPrefix(p, "/Users") {
+		return true
+	}
+	for _, prefix := range []string{"/home/", "/root/", "/etc/kubernetes", "/var/lib/kubelet", "/var/lib/docker"} {
+		if strings.HasPrefix(p, prefix) || p == strings.TrimSuffix(prefix, "/") {
+			return true
+		}
+	}
+	return false
+}
+
+// FindRiskyMountinfoEntries inspects /proc/self/mountinfo root-in-fs paths (column 4)
+// to catch Linux host bind mounts whose host path is hidden in /proc/mounts.
+func FindRiskyMountinfoEntries(mountinfoContent string, isVM bool) []string {
+	if isVM {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(mountinfoContent, "\n") {
+		pre, post, hasSep := strings.Cut(line, " - ")
+		if !hasSep {
+			continue
+		}
+		preFields := strings.Fields(pre)
+		postFields := strings.Fields(post)
+		if len(preFields) < 5 || len(postFields) < 1 {
+			continue
+		}
+		rootInFS := preFields[3]
+		mountPoint := preFields[4]
+		fsType := postFields[0]
+		if fsType == "tmpfs" || fsType == "ramfs" || fsType == "proc" || fsType == "sysfs" || fsType == "overlay" || fsType == "overlayfs" {
+			continue
+		}
+		// Skip normal OCI container runtime plumbing mounts
+		if rootInFS == "/" || strings.HasPrefix(mountPoint, "/proc/") || strings.HasPrefix(mountPoint, "/sys/") || strings.HasPrefix(mountPoint, "/dev/") {
+			continue
+		}
+		for _, sock := range []string{"docker.sock", "containerd.sock", "crio.sock"} {
+			if strings.Contains(rootInFS, sock) || strings.Contains(mountPoint, sock) {
+				out = append(out, fmt.Sprintf("mountinfo:%s->%s", rootInFS, mountPoint))
+			}
+		}
+		if isSensitiveHostBind(rootInFS) {
+			out = append(out, fmt.Sprintf("host_bind_mount:%s->%s", rootInFS, mountPoint))
+		}
+	}
+	return out
+}
+
+func mergeMountFindings(base model.ProbeResult, extra []string) model.ProbeResult {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := map[string]bool{}
+	var items []string
+	if base.Status == model.StatusFail {
+		if idx := strings.Index(base.Detail, "["); idx >= 0 && strings.HasSuffix(base.Detail, "]") {
+			existing := base.Detail[idx+1 : len(base.Detail)-1]
+			for _, part := range strings.Split(existing, ", ") {
+				if part != "" && !seen[part] {
+					seen[part] = true
+					items = append(items, part)
+				}
+			}
+		}
+	}
+	for _, e := range extra {
+		if strings.Contains(e, "docker.sock") || strings.Contains(e, "containerd.sock") || strings.Contains(e, "crio.sock") {
+			base.Severity = model.SeverityCritical
+		}
+		if !seen[e] {
+			seen[e] = true
+			items = append(items, e)
+		}
+	}
+	base.Status = model.StatusFail
+	base.Observed = fmt.Sprintf("%d_risky_mounts", len(items))
+	base.Detail = fmt.Sprintf("exposed mounts detected: [%s]", strings.Join(items, ", "))
+	return base
 }
 
 func InspectSeccompStatus(statusContent string, isVM bool) model.ProbeResult {

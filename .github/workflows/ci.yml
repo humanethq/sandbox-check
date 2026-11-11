@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Run go vet
+        run: go vet ./...
+      - name: Run unit tests with race detector
+        run: go test -race -count=1 -v ./...
+      - name: Build static Linux binaries and host smoke test
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/sandbox-check-linux-amd64 ./cmd/sandbox-check
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/sandbox-check-linux-arm64 ./cmd/sandbox-check
+          ./bin/sandbox-check-linux-amd64 --version
+          set +e
+          ./bin/sandbox-check-linux-amd64 --json --timeout 150ms --allow-public-net > smoke.json
+          rc=$?
+          set -e
+          echo "Host smoke exit code: $rc"
+          test "$rc" -eq 0 -o "$rc" -eq 2 -o "$rc" -eq 3
+          python3 -c 'import json; r=json.load(open("smoke.json")); assert r["tool"]=="sandbox-check" and r["verdict"] in ("pass","warn","fail") and r["summary"]["total"] > 0, r'
+      - name: Smoke test inside hardened scratch container
+        run: |
+          mkdir -p /tmp/sc-scratch
+          cp bin/sandbox-check-linux-amd64 /tmp/sc-scratch/sandbox-check
+          printf 'FROM scratch\nCOPY sandbox-check /sandbox-check\n' > /tmp/sc-scratch/Dockerfile
+          docker build -t sandbox-check-ci:test /tmp/sc-scratch
+          docker run --rm --network=none \
+            --user 65532:65532 \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --memory=256m \
+            --cpus=1 \
+            --pids-limit=128 \
+            sandbox-check-ci:test /sandbox-check --json --timeout 150ms > container-smoke.json
+          python3 -c 'import json; r=json.load(open("container-smoke.json")); assert r["verdict"] == "pass" and r["summary"]["failed"] == 0 and r["environment"]["detected_runtime"] == "docker_container", r'
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run macOS unit tests
+        run: go test -race -count=1 ./...
+      - name: Build macOS binary and smoke test
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o bin/sandbox-check ./cmd/sandbox-check
+          ./bin/sandbox-check --version

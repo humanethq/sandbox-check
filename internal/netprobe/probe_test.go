@@ -141,6 +141,9 @@ func TestDirectTCPProbeBlocksWhenClosedAndFailsWhenOpen(t *testing.T) {
 	if closedRes.Status != model.StatusPass {
 		t.Fatalf("closed port status = %s, want PASS", closedRes.Status)
 	}
+	if closedRes.Observed != "refused" {
+		t.Fatalf("closed port observed = %q, want refused (to distinguish TCP RST from firewall drop)", closedRes.Observed)
+	}
 }
 
 func TestProxySSRFProbeBlocksAndDetectsForwarding(t *testing.T) {
@@ -181,6 +184,78 @@ func TestProxySSRFProbeBlocksAndDetectsForwarding(t *testing.T) {
 	if warnRes.Status != model.StatusWarn {
 		t.Fatalf("502 proxy status = %s, want WARN (detail=%q)", warnRes.Status, warnRes.Detail)
 	}
+
+	// Proxy 4: path-filtering bypass — blocks first path (/latest/meta-data/) with 403,
+	// yet forwards Azure path (/metadata/instance) with 200 OK. Must NOT stop early on 403!
+	bypassProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.RequestURI, "/latest/meta-data/") {
+			http.Error(w, "blocked aws path", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"compute":{"name":"leaked"}}`))
+	}))
+	defer bypassProxy.Close()
+
+	multiRes := ProbeHTTPProxySSRFTargets(context.Background(), "proxy_ssrf_multi", bypassProxy.URL, []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+	}, nil, 500*time.Millisecond)
+	if multiRes.Status != model.StatusFail {
+		t.Fatalf("multi-path proxy bypass status = %s, want FAIL when second IMDS path returns 200 (detail=%q)", multiRes.Status, multiRes.Detail)
+	}
+}
+
+func TestProxyCONNECTSSRFProbe(t *testing.T) {
+	lnOpen, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lnOpen.Close() }()
+	go func() {
+		for {
+			c, err := lnOpen.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				buf := make([]byte, 512)
+				_, _ = conn.Read(buf)
+				_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			}(c)
+		}
+	}()
+
+	openRes := ProbeHTTPProxyConnectSSRF(context.Background(), "proxy_connect_open", "http://"+lnOpen.Addr().String(), "169.254.169.254:80", 500*time.Millisecond)
+	if openRes.Status != model.StatusFail {
+		t.Fatalf("open CONNECT proxy status = %s, want FAIL (detail=%q)", openRes.Status, openRes.Detail)
+	}
+
+	lnDeny, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lnDeny.Close() }()
+	go func() {
+		for {
+			c, err := lnDeny.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				buf := make([]byte, 512)
+				_, _ = conn.Read(buf)
+				_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"))
+			}(c)
+		}
+	}()
+
+	denyRes := ProbeHTTPProxyConnectSSRF(context.Background(), "proxy_connect_deny", "http://"+lnDeny.Addr().String(), "169.254.169.254:80", 500*time.Millisecond)
+	if denyRes.Status != model.StatusPass {
+		t.Fatalf("403 CONNECT proxy status = %s, want PASS (detail=%q)", denyRes.Status, denyRes.Detail)
+	}
 }
 
 func TestMetadataProbeFallsBackToAzureAltPath(t *testing.T) {
@@ -206,5 +281,39 @@ func TestMetadataProbeFallsBackToAzureAltPath(t *testing.T) {
 
 	if res.Status != model.StatusFail || res.Observed != "metadata_exposed_http_200" {
 		t.Fatalf("got status=%s observed=%q, want FAIL/metadata_exposed_http_200", res.Status, res.Observed)
+	}
+}
+
+func TestUDP53EchoWithoutQRBitAndTimeoutObservation(t *testing.T) {
+	// 1. Echo server mirrors raw query with QR=0 -> udp53_echo_open (FAIL, distinct from dns_tunnel_bypass)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pc.Close() }()
+	go func() {
+		buf := make([]byte, 512)
+		n, addr, readErr := pc.ReadFrom(buf)
+		if readErr != nil || n < 12 {
+			return
+		}
+		_, _ = pc.WriteTo(buf[:n], addr)
+	}()
+
+	echoRes := ProbeDirectUDPDNS(context.Background(), "udp_echo_test", pc.LocalAddr().String(), 300*time.Millisecond, true)
+	if echoRes.Status != model.StatusFail || echoRes.Observed != "udp53_echo_open" {
+		t.Fatalf("echo UDP53 got (%s, %q), want (FAIL, udp53_echo_open)", echoRes.Status, echoRes.Observed)
+	}
+
+	// 2. Unresponsive UDP listener -> dropped_timeout
+	silentPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silentPC.Close() }()
+
+	toRes := ProbeDirectUDPDNS(context.Background(), "udp_timeout_test", silentPC.LocalAddr().String(), 80*time.Millisecond, true)
+	if toRes.Status != model.StatusPass || toRes.Observed != "dropped_timeout" {
+		t.Fatalf("timed out UDP53 got (%s, %q), want (PASS, dropped_timeout)", toRes.Status, toRes.Observed)
 	}
 }

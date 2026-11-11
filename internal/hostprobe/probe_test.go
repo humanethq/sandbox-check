@@ -258,3 +258,154 @@ func TestInspectSocketAndDevicePathsMicroVMDevMem(t *testing.T) {
 		t.Fatalf("microVM host_dev_kvm status = %s, want FAIL when nested /dev/kvm exposed", vmMap["host_dev_kvm"].Status)
 	}
 }
+
+func TestDetectRuntimeDoesNotMisclassifyCgroupV2ContainerOnCloudVMAsVM(t *testing.T) {
+	// Simulate Podman/containerd container with --cgroupns=private (0::/), no /.dockerenv,
+	// overlay root filesystem in /proc/mounts, and underlying cloud VM DMI readable under /sys.
+	dir := t.TempDir()
+	for _, sub := range []string{"proc/1", "sys/class/dmi/id"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "proc", "1", "cgroup"), []byte("0::/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "proc", "mounts"), []byte("overlay / overlay rw,relatime,lowerdir=/var/lib/containers/storage/overlay/l/A,upperdir=/var/lib/containers/storage/overlay/1/diff 0 0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sys", "class", "dmi", "id", "product_name"), []byte("Virtual Machine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := detectRuntimeNameForOS("linux", dir)
+	if strings.HasPrefix(got, "vm_") || strings.HasPrefix(got, "firecracker") {
+		t.Fatalf("cgroupv2 overlay container on cloud VM misclassified as %q (must stay container, not VM!)", got)
+	}
+}
+
+func TestDetectRuntimeIdentifiesPodmanContainerenvAndPid1Environ(t *testing.T) {
+	dirPodman := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dirPodman, "run"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dirPodman, "sys/class/dmi/id"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirPodman, "run", ".containerenv"), []byte("engine=\"podman\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirPodman, "sys", "class", "dmi", "id", "product_name"), []byte("Google Compute Engine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectRuntimeNameForOS("linux", dirPodman); got != "podman_container" {
+		t.Fatalf("podman .containerenv = %q, want podman_container", got)
+	}
+
+	dirNspawn := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dirNspawn, "proc/1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dirNspawn, "sys/class/dmi/id"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirNspawn, "proc", "1", "environ"), []byte("PATH=/usr/sbin\x00container=systemd-nspawn\x00"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirNspawn, "sys", "class", "dmi", "id", "product_name"), []byte("Amazon EC2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectRuntimeNameForOS("linux", dirNspawn); got != "nspawn_container" {
+		t.Fatalf("nspawn environ = %q, want nspawn_container", got)
+	}
+}
+
+func TestCheckCgroupV2WarnsOnUnthrottledCPU(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("536870912\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte("256\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cpu.max"), []byte("max 100000\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := InspectCgroupV2Dir(dir)
+	if res.Status != model.StatusWarn {
+		t.Fatalf("status = %s, want WARN for bounded mem/pids + unthrottled cpu.max (detail=%q)", res.Status, res.Detail)
+	}
+	if res.Observed != "unthrottled_cpu" {
+		t.Fatalf("observed = %q, want unthrottled_cpu", res.Observed)
+	}
+}
+
+func TestCheckCgroupV1FallbackLimits(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"memory", "pids", "cpu"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Kernel unlimited memory in cgroup v1 is >= 1<<60 (~9223372036854771712).
+	if err := os.WriteFile(filepath.Join(dir, "memory", "memory.limit_in_bytes"), []byte("9223372036854771712\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pids", "pids.max"), []byte("max\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cpu", "cpu.cfs_quota_us"), []byte("-1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	failRes := InspectCgroupV1Dir(dir)
+	if failRes.Status != model.StatusFail {
+		t.Fatalf("unbounded cgroup v1 status = %s, want FAIL (detail=%q)", failRes.Status, failRes.Detail)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "memory", "memory.limit_in_bytes"), []byte("268435456\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pids", "pids.max"), []byte("128\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	warnRes := InspectCgroupV1Dir(dir)
+	if warnRes.Status != model.StatusWarn {
+		t.Fatalf("cgroup v1 with cpu.cfs_quota_us=-1 status = %s, want WARN (detail=%q)", warnRes.Status, warnRes.Detail)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "cpu", "cpu.cfs_quota_us"), []byte("100000\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	passRes := InspectCgroupV1Dir(dir)
+	if passRes.Status != model.StatusPass {
+		t.Fatalf("bounded cgroup v1 status = %s, want PASS (detail=%q)", passRes.Status, passRes.Detail)
+	}
+}
+
+func TestInspectMountsDetectsLinuxHostBindsAndIgnoresTmpfs(t *testing.T) {
+	riskyMounts := strings.Join([]string{
+		"overlay / overlay rw,relatime 0 0",
+		"/dev/nvme0n1p1 /home/developer ext4 rw,relatime 0 0",
+		"tmpfs /root tmpfs rw,nosuid,nodev 0 0",
+	}, "\n")
+	res := InspectMountsContent(riskyMounts, false)
+	if res.Status != model.StatusFail {
+		t.Fatalf("linux /home bind mount status = %s, want FAIL (detail=%q)", res.Status, res.Detail)
+	}
+
+	tmpfsOnly := strings.Join([]string{
+		"overlay / overlay rw,relatime 0 0",
+		"tmpfs /home/sandbox tmpfs rw,nosuid,nodev,noexec 0 0",
+		"tmpfs /root tmpfs rw,nosuid,nodev,noexec 0 0",
+	}, "\n")
+	if res := InspectMountsContent(tmpfsOnly, false); res.Status != model.StatusPass {
+		t.Fatalf("read-only container tmpfs under /home or /root falsely failed: %s (detail=%q)", res.Status, res.Detail)
+	}
+
+	mountinfo := "412 411 259:1 /home/ubuntu/.aws /app/.aws ro,relatime - ext4 /dev/nvme0n1p1 rw\n"
+	if bad := FindRiskyMountinfoEntries(mountinfo, false); len(bad) == 0 {
+		t.Fatalf("expected /proc/self/mountinfo /home/ubuntu/.aws bind mount to be flagged")
+	}
+}

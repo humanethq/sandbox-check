@@ -32,6 +32,64 @@ func TestRunEmitsValidJSONWithoutSecretLeak(t *testing.T) {
 	if !strings.Contains(string(raw), "OPENAI_API_KEY") {
 		t.Fatalf("expected OPENAI_API_KEY key name in report, got: %s", string(raw))
 	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	v, ok := decoded["verdict"].(string)
+	if !ok || (v != "pass" && v != "warn" && v != "fail") {
+		t.Fatalf("expected top-level JSON verdict in {pass,warn,fail}, got %#v", decoded["verdict"])
+	}
+}
+
+func TestWarnOnlyReportSetsWarnVerdictAndNonZeroExitCode(t *testing.T) {
+	r := model.Report{
+		Tool:        "sandbox-check",
+		Version:     "v0.2.0-test",
+		GeneratedAt: time.Unix(1700000000, 0).UTC(),
+		Environment: model.EnvironmentInfo{
+			OS:              "linux",
+			Arch:            "amd64",
+			DetectedRuntime: "docker_container",
+			ProxyConfigured: true,
+		},
+		Probes: []model.ProbeResult{
+			{
+				ID:       "proxy_ssrf_loopback_docker",
+				Category: model.CategoryProxyBypass,
+				Severity: model.SeverityCritical,
+				Status:   model.StatusWarn,
+				Target:   "http://127.0.0.1:2375/_ping",
+				Observed: "proxy_upstream_error_http_502",
+				Detail:   "proxy attempted upstream dial",
+			},
+		},
+	}
+	r.Summary = model.ComputeSummary(r.Probes)
+	r.Verdict = model.ComputeVerdict(r.Summary)
+
+	if r.Verdict != model.VerdictWarn {
+		t.Fatalf("Verdict = %q, want warn", r.Verdict)
+	}
+	if code := model.ExitCode(r.Summary); code != 3 {
+		t.Fatalf("ExitCode = %d, want 3 for warn-only report", code)
+	}
+
+	var buf bytes.Buffer
+	renderReport(&buf, r)
+	out := buf.String()
+	if strings.Contains(out, "NO DETECTED LEAKS") {
+		t.Fatalf("warn-only report falsely claimed NO DETECTED LEAKS:\n%s", out)
+	}
+	if !strings.Contains(out, "WARNINGS DETECTED / INCONCLUSIVE") {
+		t.Fatalf("expected WARNINGS DETECTED / INCONCLUSIVE in output, got:\n%s", out)
+	}
+
+	var strictBuf bytes.Buffer
+	renderReportWithOptions(&strictBuf, r, true)
+	if !strings.Contains(strictBuf.String(), "exit code 2") {
+		t.Fatalf("expected strict mode to render exit code 2, got:\n%s", strictBuf.String())
+	}
 }
 
 func TestPrintTextReportSummarizesFailuresAndCounts(t *testing.T) {

@@ -18,7 +18,7 @@ import (
 	"github.com/humanethq/sandbox-check/internal/netprobe"
 )
 
-var version = "v0.1.0-dev"
+var version = "v0.2.0-dev"
 
 type Config struct {
 	Root           string
@@ -65,6 +65,7 @@ func Run(ctx context.Context, cfg Config) model.Report {
 	return model.Report{
 		Tool:        "sandbox-check",
 		Version:     version,
+		Verdict:     model.ComputeVerdict(summary),
 		GeneratedAt: time.Now().UTC(),
 		Environment: envInfo,
 		Probes:      allProbes,
@@ -83,6 +84,7 @@ func main() {
 	peer := flag.String("peer", "", "optional cross-tenant peer ip:port to assert L3 isolation")
 	extIP := flag.String("external-ip", "1.1.1.1", "external IP used for direct raw egress bypass probes")
 	allowPublicNet := flag.Bool("allow-public-net", false, "do not mark direct outbound TCP:443 as a failure when intentionally allowed")
+	strict := flag.Bool("strict", false, "treat WARN results as failures (exit code 2 instead of 3)")
 	showVersion := flag.Bool("version", false, "print Humanet sandbox-check version and exit")
 	flag.Usage = func() {
 		uOut := flag.CommandLine.Output()
@@ -109,6 +111,7 @@ func main() {
 		AllowPublicNet: *allowPublicNet,
 	})
 	summary := report.Summary
+	exitCode := model.ExitCodeWithOptions(summary, *strict)
 
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -117,14 +120,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Humanet sandbox-check: encode json: %v\n", err)
 			os.Exit(1)
 		}
-		os.Exit(model.ExitCode(summary))
+		os.Exit(exitCode)
 	}
 
-	renderReport(os.Stdout, report)
-	os.Exit(model.ExitCode(summary))
+	renderReportWithOptions(os.Stdout, report, *strict)
+	os.Exit(exitCode)
 }
 
 func renderReport(w io.Writer, r model.Report) {
+	renderReportWithOptions(w, r, false)
+}
+
+func renderReportWithOptions(w io.Writer, r model.Report, strict bool) {
 	_, _ = fmt.Fprintf(w, "HUMANET SANDBOX-CHECK %s — runtime=%s (%s/%s) uid=%d pid1=%q gw=%q proxy_env=%v\n",
 		r.Version,
 		r.Environment.DetectedRuntime,
@@ -192,10 +199,20 @@ func renderReport(w io.Writer, r model.Report) {
 		r.Summary.Critical,
 		r.Summary.High,
 	)
-	if r.Summary.Failed > 0 {
-		_, _ = fmt.Fprintf(w, "RESULT: ISOLATION GAPS DETECTED (exit code %d)\n", model.ExitCode(r.Summary))
-	} else {
-		_, _ = fmt.Fprintf(w, "RESULT: NO DETECTED LEAKS WITHIN TESTED CHECKS (exit code %d)\n", model.ExitCode(r.Summary))
+	code := model.ExitCodeWithOptions(r.Summary, strict)
+	verdict := r.Verdict
+	if verdict == "" {
+		verdict = model.ComputeVerdict(r.Summary)
+	}
+	switch {
+	case r.Summary.Failed > 0:
+		_, _ = fmt.Fprintf(w, "RESULT: ISOLATION GAPS DETECTED [verdict=%s] (exit code %d)\n", verdict, code)
+	case r.Summary.Warned > 0 && strict:
+		_, _ = fmt.Fprintf(w, "RESULT: WARNINGS TREATED AS FAILURE (--strict) [verdict=%s] (exit code %d)\n", verdict, code)
+	case r.Summary.Warned > 0:
+		_, _ = fmt.Fprintf(w, "RESULT: WARNINGS DETECTED / INCONCLUSIVE [verdict=%s] (exit code %d)\n", verdict, code)
+	default:
+		_, _ = fmt.Fprintf(w, "RESULT: NO DETECTED LEAKS WITHIN TESTED CHECKS [verdict=%s] (exit code %d)\n", verdict, code)
 	}
 }
 

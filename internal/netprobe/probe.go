@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/humanethq/sandbox-check/internal/model"
@@ -161,8 +163,7 @@ func ProbeMetadataHTTP(ctx context.Context, target MetadataTarget, timeout time.
 	if err != nil {
 		res.DurationMs = time.Since(start).Milliseconds()
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(err)
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
 		return res
 	}
 	_ = conn.Close()
@@ -216,7 +217,7 @@ func ProbeMetadataHTTP(ctx context.Context, target MetadataTarget, timeout time.
 		_ = resp.Body.Close()
 
 		hit := &httpHit{status: resp.StatusCode, url: reqURL, n: n}
-		if bestHit == nil || (hit.status >= 200 && hit.status < 300 && (bestHit.status < 200 || bestHit.status >= 300)) {
+		if bestHit == nil || httpStatusRank(hit.status) > httpStatusRank(bestHit.status) {
 			bestHit = hit
 		}
 		if hit.status >= 200 && hit.status < 300 {
@@ -280,8 +281,7 @@ func ProbeDirectUDPDNS(ctx context.Context, id, addr string, timeout time.Durati
 	if err != nil {
 		res.DurationMs = time.Since(start).Milliseconds()
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(err)
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
 		return res
 	}
 	defer func() { _ = conn.Close() }()
@@ -290,8 +290,7 @@ func ProbeDirectUDPDNS(ctx context.Context, id, addr string, timeout time.Durati
 	if _, err := conn.Write(pkt); err != nil {
 		res.DurationMs = time.Since(start).Milliseconds()
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(err)
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
 		return res
 	}
 
@@ -300,18 +299,22 @@ func ProbeDirectUDPDNS(ctx context.Context, id, addr string, timeout time.Durati
 	res.DurationMs = time.Since(start).Milliseconds()
 	if err != nil {
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(err)
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
 		return res
 	}
 	if n >= 12 && binary.BigEndian.Uint16(buf[0:2]) == txID {
 		res.Status = model.StatusFail
-		if proxyConfigured {
+		qrSet := (buf[2] & 0x80) != 0
+		switch {
+		case qrSet && proxyConfigured:
 			res.Observed = "dns_tunnel_bypass"
 			res.Detail = fmt.Sprintf("HTTP_PROXY is set, but raw UDP:53 to %s succeeded (%d byte DNS reply) — DNS tunneling bypasses proxy", addr, n)
-		} else {
+		case qrSet:
 			res.Observed = "direct_udp53_open"
 			res.Detail = fmt.Sprintf("raw UDP:53 packet to external resolver %s answered (%d bytes) — unrestricted DNS exfiltration channel", addr, n)
+		default:
+			res.Observed = "udp53_echo_open"
+			res.Detail = fmt.Sprintf("raw UDP:53 to %s echoed non-DNS reply with matching txID (%d bytes) — raw UDP:53 egress is open", addr, n)
 		}
 		return res
 	}
@@ -338,8 +341,7 @@ func ProbeTCPBlocked(ctx context.Context, id string, category model.Category, se
 	res.DurationMs = time.Since(start).Milliseconds()
 	if err != nil {
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(err)
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
 		return res
 	}
 	_ = conn.Close()
@@ -353,6 +355,19 @@ func ProbeTCPBlocked(ctx context.Context, id string, category model.Category, se
 // ProbeHTTPProxySSRF checks whether a configured sandbox HTTP_PROXY permits SSRF to IMDS/loopback targets.
 func ProbeHTTPProxySSRF(ctx context.Context, id, proxyRawURL, targetURL string, timeout time.Duration) model.ProbeResult {
 	return ProbeHTTPProxySSRFTargets(ctx, id, proxyRawURL, []string{targetURL}, nil, timeout)
+}
+
+func httpStatusRank(status int) int {
+	switch {
+	case status >= 200 && status < 300:
+		return 4
+	case status == http.StatusForbidden || status == http.StatusProxyAuthRequired || status == http.StatusUnavailableForLegalReasons:
+		return 1
+	case status >= 500:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // ProbeHTTPProxySSRFTargets tests candidate URLs through proxyRawURL and upgrades to HTTP 200 if any path succeeds.
@@ -422,12 +437,8 @@ func ProbeHTTPProxySSRFTargets(ctx context.Context, id, proxyRawURL string, targ
 		_ = resp.Body.Close()
 
 		hit := &proxyHit{status: resp.StatusCode, url: u, n: n}
-		if best == nil || (hit.status >= 200 && hit.status < 300 && (best.status < 200 || best.status >= 300)) {
+		if best == nil || httpStatusRank(hit.status) > httpStatusRank(best.status) {
 			best = hit
-		}
-		if hit.status == http.StatusForbidden || hit.status == http.StatusProxyAuthRequired || hit.status == http.StatusUnavailableForLegalReasons {
-			best = hit
-			break
 		}
 		if hit.status >= 200 && hit.status < 300 {
 			break
@@ -437,8 +448,7 @@ func ProbeHTTPProxySSRFTargets(ctx context.Context, id, proxyRawURL string, targ
 	res.DurationMs = time.Since(start).Milliseconds()
 	if best == nil {
 		res.Status = model.StatusPass
-		res.Observed = "blocked"
-		res.Detail = classifyNetError(lastErr)
+		res.Observed, res.Detail = classifyObservedAndDetail(lastErr)
 		return res
 	}
 	res.Target = best.url
@@ -460,27 +470,120 @@ func ProbeHTTPProxySSRFTargets(ctx context.Context, id, proxyRawURL string, targ
 	return res
 }
 
-func classifyNetError(err error) string {
+// ProbeHTTPProxyConnectSSRF tests whether HTTP_PROXY permits raw CONNECT tunneling to an internal host:port.
+func ProbeHTTPProxyConnectSSRF(ctx context.Context, id, proxyRawURL, targetAddr string, timeout time.Duration) model.ProbeResult {
+	start := time.Now()
+	res := model.ProbeResult{
+		ID:       id,
+		Category: model.CategoryProxyBypass,
+		Severity: model.SeverityCritical,
+		Target:   "CONNECT " + targetAddr,
+		Expected: "blocked by proxy (403/407/451 or refused)",
+	}
+
+	raw := strings.TrimSpace(proxyRawURL)
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	proxyURL, err := url.Parse(raw)
+	if err != nil || proxyURL.Host == "" {
+		res.DurationMs = time.Since(start).Milliseconds()
+		res.Status = model.StatusSkip
+		res.Observed = "invalid_proxy_url"
+		res.Detail = "could not parse proxy URL"
+		return res
+	}
+
+	proxyHost := proxyURL.Host
+	if _, _, splitErr := net.SplitHostPort(proxyHost); splitErr != nil {
+		defaultPort := "80"
+		if proxyURL.Scheme == "https" {
+			defaultPort = "443"
+		}
+		proxyHost = net.JoinHostPort(proxyHost, defaultPort)
+	}
+
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", proxyHost)
+	if err != nil {
+		res.DurationMs = time.Since(start).Milliseconds()
+		res.Status = model.StatusPass
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
+		return res
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	authHeader := ""
+	if proxyURL.User != nil {
+		cred := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.String()))
+		authHeader = "Proxy-Authorization: Basic " + cred + "\r\n"
+	}
+	reqStr := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n%sProxy-Connection: keep-alive\r\n\r\n", targetAddr, targetAddr, authHeader)
+	if _, err := io.WriteString(conn, reqStr); err != nil {
+		res.DurationMs = time.Since(start).Milliseconds()
+		res.Status = model.StatusPass
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
+		return res
+	}
+
+	dummyReq, _ := http.NewRequest(http.MethodConnect, "http://"+targetAddr, nil)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), dummyReq)
+	res.DurationMs = time.Since(start).Milliseconds()
+	if err != nil {
+		res.Status = model.StatusPass
+		res.Observed, res.Detail = classifyObservedAndDetail(err)
+		return res
+	}
+	_ = resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusProxyAuthRequired || resp.StatusCode == http.StatusUnavailableForLegalReasons:
+		res.Status = model.StatusPass
+		res.Observed = fmt.Sprintf("proxy_connect_denied_http_%d", resp.StatusCode)
+		res.Detail = fmt.Sprintf("proxy explicitly denied CONNECT tunnel to %s with HTTP %d", targetAddr, resp.StatusCode)
+	case resp.StatusCode >= 500:
+		res.Status = model.StatusWarn
+		res.Observed = fmt.Sprintf("proxy_connect_upstream_error_http_%d", resp.StatusCode)
+		res.Detail = fmt.Sprintf("proxy CONNECT to %s returned HTTP %d without explicit 403/407 deny (may have attempted upstream dial)", targetAddr, resp.StatusCode)
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		res.Status = model.StatusFail
+		res.Observed = "proxy_connect_tunnel_open"
+		res.Detail = fmt.Sprintf("HTTP_PROXY opened raw CONNECT tunnel to %s (HTTP %d) — arbitrary internal TCP tunnel via proxy", targetAddr, resp.StatusCode)
+	default:
+		res.Status = model.StatusFail
+		res.Observed = fmt.Sprintf("proxy_connect_http_%d", resp.StatusCode)
+		res.Detail = fmt.Sprintf("HTTP_PROXY CONNECT %s responded HTTP %d", targetAddr, resp.StatusCode)
+	}
+	return res
+}
+
+func classifyObservedAndDetail(err error) (string, string) {
 	if err == nil {
-		return "none"
+		return "none", "none"
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return "timed out (likely dropped by firewall/nftables or blackhole route)"
+	if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+		return "dropped_timeout", "timed out (likely dropped by firewall/nftables or blackhole route)"
 	}
 	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "connection refused"):
-		return "connection refused"
-	case strings.Contains(msg, "network is unreachable"):
-		return "network is unreachable"
-	case strings.Contains(msg, "no route to host"):
-		return "no route to host"
-	case strings.Contains(msg, "operation not permitted"), strings.Contains(msg, "permission denied"):
-		return "blocked by seccomp/socket policy (EPERM)"
+	case errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(msg, "connection refused"):
+		return "refused", "connection refused (TCP RST received — target stack reachable, port closed)"
+	case errors.Is(err, syscall.ENETUNREACH) || strings.Contains(msg, "network is unreachable"):
+		return "unreachable", "network is unreachable"
+	case errors.Is(err, syscall.EHOSTUNREACH) || strings.Contains(msg, "no route to host"):
+		return "no_route", "no route to host"
+	case errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) || strings.Contains(msg, "operation not permitted") || strings.Contains(msg, "permission denied"):
+		return "blocked_seccomp", "blocked by seccomp/socket policy (EPERM/EACCES)"
 	default:
-		return msg
+		return "blocked_error", msg
 	}
+}
+
+func classifyNetError(err error) string {
+	_, detail := classifyObservedAndDetail(err)
+	return detail
 }
 
 func RunAll(ctx context.Context, opts Options) ([]model.ProbeResult, model.EnvironmentInfo) {
@@ -639,13 +742,14 @@ func RunAll(ctx context.Context, opts Options) ([]model.ProbeResult, model.Envir
 		{"10250", "kubelet", model.SeverityCritical},
 		{"11434", "ollama", model.SeverityMedium},
 	}
+	idSanitizer := strings.NewReplacer(".", "_", ":", "_", "[", "", "]", "")
 	for _, h := range hostTargets {
 		if seenHost[h] {
 			continue
 		}
 		seenHost[h] = true
 		for _, p := range hostPorts {
-			id := fmt.Sprintf("host_%s_%s_%s", strings.ReplaceAll(h, ".", "_"), p.name, p.port)
+			id := fmt.Sprintf("host_%s_%s_%s", idSanitizer.Replace(h), p.name, p.port)
 			addr := net.JoinHostPort(h, p.port)
 			sev := p.sev
 			checks = append(checks, func(c context.Context) model.ProbeResult {
@@ -694,6 +798,12 @@ func RunAll(ctx context.Context, opts Options) ([]model.ProbeResult, model.Envir
 			},
 			func(c context.Context) model.ProbeResult {
 				return ProbeHTTPProxySSRF(c, "proxy_ssrf_loopback_docker", proxyCopy, "http://127.0.0.1:2375/_ping", timeout)
+			},
+			func(c context.Context) model.ProbeResult {
+				return ProbeHTTPProxyConnectSSRF(c, "proxy_connect_imds_v4", proxyCopy, "169.254.169.254:80", timeout)
+			},
+			func(c context.Context) model.ProbeResult {
+				return ProbeHTTPProxyConnectSSRF(c, "proxy_connect_loopback_docker", proxyCopy, "127.0.0.1:2375", timeout)
 			},
 		)
 	}
