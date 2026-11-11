@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26'
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"
@@ -47,6 +47,7 @@ jobs:
           cp bin/sandbox-check-linux-amd64 /tmp/sc-scratch/sandbox-check
           printf 'FROM scratch\nCOPY sandbox-check /sandbox-check\n' > /tmp/sc-scratch/Dockerfile
           docker build -t sandbox-check-ci:test /tmp/sc-scratch
+          set +e
           docker run --rm --network=none \
             --user 65532:65532 \
             --cap-drop=ALL \
@@ -56,6 +57,11 @@ jobs:
             --cpus=1 \
             --pids-limit=128 \
             sandbox-check-ci:test /sandbox-check --json --timeout 150ms > container-smoke.json
+          rc=$?
+          set -e
+          cat container-smoke.json
+          echo "Container smoke exit code: $rc"
+          test "$rc" -eq 0
           python3 -c 'import json; r=json.load(open("container-smoke.json")); assert r["verdict"] == "pass" and r["summary"]["failed"] == 0 and r["environment"]["detected_runtime"] == "docker_container", r'
 
   test-macos:
@@ -64,7 +70,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26'
       - name: Run macOS unit tests
         run: go test -race -count=1 ./...
       - name: Build macOS binary and smoke test

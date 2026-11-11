@@ -404,8 +404,13 @@ func TestInspectMountsDetectsLinuxHostBindsAndIgnoresTmpfs(t *testing.T) {
 		t.Fatalf("read-only container tmpfs under /home or /root falsely failed: %s (detail=%q)", res.Status, res.Detail)
 	}
 
-	mountinfo := "412 411 259:1 /home/ubuntu/.aws /app/.aws ro,relatime - ext4 /dev/nvme0n1p1 rw\n"
-	if bad := FindRiskyMountinfoEntries(mountinfo, false); len(bad) == 0 {
-		t.Fatalf("expected /proc/self/mountinfo /home/ubuntu/.aws bind mount to be flagged")
+	mountinfo := strings.Join([]string{
+		"412 411 259:1 /home/ubuntu/.aws /app/.aws ro,relatime - ext4 /dev/nvme0n1p1 rw",
+		"413 411 259:1 /var/lib/docker/containers/abcd1234/hosts /etc/hosts rw,relatime - ext4 /dev/nvme0n1p1 rw",
+		"414 411 259:1 /var/lib/docker/containers/abcd1234/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/nvme0n1p1 rw",
+	}, "\n")
+	bad := FindRiskyMountinfoEntries(mountinfo, false)
+	if len(bad) != 1 || !strings.Contains(bad[0], ".aws") {
+		t.Fatalf("expected only /home/ubuntu/.aws bind mount to be flagged (ignoring Docker /etc/hosts plumbing), got %v", bad)
 	}
 }

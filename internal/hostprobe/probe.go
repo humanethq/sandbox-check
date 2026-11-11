@@ -767,8 +767,15 @@ func FindRiskyMountinfoEntries(mountinfoContent string, isVM bool) []string {
 		if fsType == "tmpfs" || fsType == "ramfs" || fsType == "proc" || fsType == "sysfs" || fsType == "overlay" || fsType == "overlayfs" {
 			continue
 		}
-		// Skip normal OCI container runtime plumbing mounts
-		if rootInFS == "/" || strings.HasPrefix(mountPoint, "/proc/") || strings.HasPrefix(mountPoint, "/sys/") || strings.HasPrefix(mountPoint, "/dev/") {
+		// Skip normal OCI/Docker/K8s per-container plumbing mounts
+		if rootInFS == "/" ||
+			strings.HasPrefix(mountPoint, "/proc/") ||
+			strings.HasPrefix(mountPoint, "/sys/") ||
+			strings.HasPrefix(mountPoint, "/dev/") ||
+			mountPoint == "/etc/hosts" ||
+			mountPoint == "/etc/hostname" ||
+			mountPoint == "/etc/resolv.conf" ||
+			strings.HasPrefix(rootInFS, "/var/lib/kubelet/pods/") {
 			continue
 		}
 		for _, sock := range []string{"docker.sock", "containerd.sock", "crio.sock"} {
