@@ -1,0 +1,328 @@
+{
+  "tool": "sandbox-probe",
+  "version": "v0.1.0",
+  "generated_at": "2026-11-11T16:47:57.403126815Z",
+  "environment": {
+    "os": "linux",
+    "arch": "amd64",
+    "hostname": "2d1174d9b348",
+    "uid": 65532,
+    "gid": 65532,
+    "pid1_name": "sandbox-probe",
+    "detected_runtime": "docker_container",
+    "resolvers": [
+      "1.1.1.1",
+      "8.8.8.8",
+      "168.63.129.16"
+    ],
+    "proxy_configured": false
+  },
+  "probes": [
+    {
+      "id": "baseline_network_posture",
+      "category": "baseline",
+      "severity": "info",
+      "status": "INFO",
+      "expected": "documented network posture (prevents false-negative confusion)",
+      "observed": "no_external_interface",
+      "detail": "non-loopback IPs=[none] gateway=\"\" resolvers=[1.1.1.1 8.8.8.8 168.63.129.16] proxy_env=false",
+      "duration_ms": 0
+    },
+    {
+      "id": "imds_aws_gcp_azure_v4",
+      "category": "metadata",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "169.254.169.254:80/latest/meta-data/",
+      "expected": "blocked (drop, unreachable, or explicit proxy deny)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "imds_aws_imdsv2_token",
+      "category": "metadata",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "169.254.169.254:80/latest/api/token",
+      "expected": "blocked (drop, unreachable, or explicit proxy deny)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "imds_aws_ecs_task",
+      "category": "metadata",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "169.254.170.2:80/v2/metadata",
+      "expected": "blocked (drop, unreachable, or explicit proxy deny)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "imds_aws_ipv6",
+      "category": "metadata",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "[fd00:ec2::254]:80/latest/meta-data/",
+      "expected": "blocked (drop, unreachable, or explicit proxy deny)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "imds_alibaba",
+      "category": "metadata",
+      "severity": "high",
+      "status": "PASS",
+      "target": "100.100.100.200:80/latest/meta-data/",
+      "expected": "blocked (drop, unreachable, or explicit proxy deny)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "bypass_udp53_cloudflare",
+      "category": "proxy_bypass",
+      "severity": "high",
+      "status": "PASS",
+      "target": "1.1.1.1:53/udp",
+      "expected": "blocked (direct UDP:53 egress dropped)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "bypass_udp53_google",
+      "category": "proxy_bypass",
+      "severity": "high",
+      "status": "PASS",
+      "target": "8.8.8.8:53/udp",
+      "expected": "blocked (direct UDP:53 egress dropped)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "bypass_tcp53_direct",
+      "category": "proxy_bypass",
+      "severity": "high",
+      "status": "PASS",
+      "target": "1.1.1.1:53",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "bypass_direct_tcp443",
+      "category": "proxy_bypass",
+      "severity": "high",
+      "status": "PASS",
+      "target": "1.1.1.1:443",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "rfc1918_10_0_0_1",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "10.0.0.1:80",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "rfc1918_172_16_0_1",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "172.16.0.1:80",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "rfc1918_172_17_0_1",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "172.17.0.1:80",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "rfc1918_192_168_1_1",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "192.168.1.1:80",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "cgnat_100_64_0_1",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "100.64.0.1:80",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "smtp_egress_tcp25",
+      "category": "lateral_smtp",
+      "severity": "high",
+      "status": "PASS",
+      "target": "1.1.1.1:25",
+      "expected": "blocked (timeout, refused, or network unreachable)",
+      "observed": "blocked",
+      "detail": "network is unreachable",
+      "duration_ms": 0
+    },
+    {
+      "id": "linux_capabilities_and_seccomp",
+      "category": "runtime_surface",
+      "severity": "high",
+      "status": "PASS",
+      "target": "/proc/self/status",
+      "expected": "minimal capabilities (zero dangerous caps) in shared-kernel containers, or hypervisor isolation in microVMs",
+      "observed": "minimal_caps",
+      "detail": "zero dangerous caps in CapEff=0000000000000000 NoNewPrivs=1 Seccomp=2 uid=65532",
+      "duration_ms": 0
+    },
+    {
+      "id": "linux_seccomp_policy",
+      "category": "runtime_surface",
+      "severity": "high",
+      "status": "PASS",
+      "target": "/proc/self/status",
+      "expected": "seccomp filtering active in shared-kernel containers, or hypervisor hardware isolation in microVM",
+      "observed": "seccomp_mode_2",
+      "detail": "Seccomp=2 (filtering active), NoNewPrivs=1",
+      "duration_ms": 0
+    },
+    {
+      "id": "proc_mounts_exposure",
+      "category": "runtime_surface",
+      "severity": "high",
+      "status": "PASS",
+      "target": "/proc/mounts",
+      "expected": "no host runtime sockets, host home bind mounts, or rw shared cgroup mounts",
+      "observed": "clean",
+      "detail": "no risky host socket, user home, or rw shared cgroup mounts detected",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_kernel_proc_sys_surface",
+      "category": "runtime_surface",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "/proc/kcore, /proc/sysrq-trigger, /proc/sys/kernel/core_pattern",
+      "expected": "not directly writable or readable from shared container",
+      "observed": "blocked",
+      "detail": "/proc/kcore, /proc/sysrq-trigger, core_pattern, uevent_helper are masked/read-only",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_docker_socket",
+      "category": "runtime_surface",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "/var/run/docker.sock",
+      "expected": "absent or inaccessible inside sandbox",
+      "observed": "absent",
+      "detail": "stat /var/run/docker.sock: no such file or directory",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_containerd_socket",
+      "category": "runtime_surface",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "/run/containerd/containerd.sock",
+      "expected": "absent or inaccessible inside sandbox",
+      "observed": "absent",
+      "detail": "stat /run/containerd/containerd.sock: no such file or directory",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_crio_socket",
+      "category": "runtime_surface",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "/run/crio/crio.sock",
+      "expected": "absent or inaccessible inside sandbox",
+      "observed": "absent",
+      "detail": "stat /run/crio/crio.sock: no such file or directory",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_dev_kvm",
+      "category": "runtime_surface",
+      "severity": "high",
+      "status": "PASS",
+      "target": "/dev/kvm",
+      "expected": "absent or inaccessible inside sandbox",
+      "observed": "absent",
+      "detail": "stat /dev/kvm: no such file or directory",
+      "duration_ms": 0
+    },
+    {
+      "id": "host_dev_mem",
+      "category": "runtime_surface",
+      "severity": "critical",
+      "status": "PASS",
+      "target": "/dev/mem",
+      "expected": "absent or inaccessible inside sandbox",
+      "observed": "absent",
+      "detail": "stat /dev/mem: no such file or directory",
+      "duration_ms": 0
+    },
+    {
+      "id": "cgroup_v2_limits",
+      "category": "resource_limits",
+      "severity": "high",
+      "status": "PASS",
+      "target": "/sys/fs/cgroup",
+      "expected": "bounded memory.max and pids.max (and cpu.max recommended)",
+      "observed": "bounded",
+      "detail": "memory.max=\"268435456\" pids.max=\"128\" cpu.max=\"100000 100000\"",
+      "duration_ms": 0
+    },
+    {
+      "id": "env_secret_exposure",
+      "category": "env_secrets",
+      "severity": "high",
+      "status": "PASS",
+      "target": "process environment",
+      "expected": "zero raw API keys/secrets in guest env (phantom tokens or secretless proxy preferred)",
+      "observed": "no_secret_vars",
+      "detail": "no sensitive credential variables found in environment",
+      "duration_ms": 0
+    }
+  ],
+  "summary": {
+    "total": 27,
+    "passed": 26,
+    "failed": 0,
+    "warned": 0,
+    "info": 1,
+    "skipped": 0,
+    "critical_leaks": 0,
+    "high_leaks": 0
+  }
+}
